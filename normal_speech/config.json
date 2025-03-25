@@ -1,0 +1,10 @@
+{
+    "n_embed": 512,
+    "n_heads": 6,
+    "n_layers": 6,
+    "dropout": 0.2,
+    "vocab_size": 1024,
+    "sample_rate": 16000,
+    "length_of_clips": 10,
+    "block_size": 2000
+  }
