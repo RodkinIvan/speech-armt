@@ -6,6 +6,7 @@ from datasets import load_dataset
 from transformers import Trainer, TrainingArguments
 import wandb
 from tqdm import tqdm
+import json
 
 
 
@@ -16,6 +17,7 @@ from utils import (
     normalize_waveform,
     tokenize_waveform,
     get_audio_files,
+    process_audio_dataset,
     convert_mp4_to_wav_clips,
     download_audio_from_playlist,
     AudioTokenDataset,
@@ -26,7 +28,7 @@ from utils import (
     length_of_clips,
     MambaAudioModel,
     HFModelWrapper,
-    filter_audio_length
+    filter_audio_length,
 )
 
 #############################
@@ -44,6 +46,9 @@ vocab_size = config["vocab_size"]
 sample_rate = config["sample_rate"]
 length_of_clips = config["length_of_clips"]
 block_size = config["block_size"]
+epochs = config["epochs"]
+lr = config["learning_rate"]
+
 NUM_QUANTIZERS_USED = 4
 
 ##########################################
@@ -59,7 +64,7 @@ playlist_url = "https://www.youtube.com/watch?v=Lp7E973zozc&list=PLQltO7RlbjPJnb
 download_audio_from_playlist(playlist_url, 'audio/')
 audio_files = get_audio_files('audio', extension='.mp4')
 for af in tqdm(audio_files):
-    convert_mp4_to_wav_clips(af, 'MarcBotClips', LENGTH_OF_CLIPS)
+    convert_mp4_to_wav_clips(af, 'MarcBotClips', length_of_clips)
 
 ##########################################
 # Create and Preprocess Dataset
