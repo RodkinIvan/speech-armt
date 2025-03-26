@@ -33,15 +33,18 @@ from utils import (
 # Hyperparameters & Device  #
 #############################
 device = torch.device("cuda")
-batch_size = 4
-epochs = 15
-lr = 1e-4
-block_size = 2000
-n_embed = 512
-n_heads = 6
-n_layers = 6
-dropout = 0.2
-vocab_size = 1024
+with open("./config.json", "r") as f:
+    config = json.load(f)
+
+n_embed = config["n_embed"]
+n_heads = config["n_heads"]
+n_layers = config["n_layers"]
+dropout = config["dropout"]
+vocab_size = config["vocab_size"]
+sample_rate = config["sample_rate"]
+length_of_clips = config["length_of_clips"]
+block_size = config["block_size"]
+NUM_QUANTIZERS_USED = 4
 
 ##########################################
 # Load SpeechTokenizer and Process Audio
@@ -50,9 +53,8 @@ vocab_size = 1024
 config_path = './SpeechTokenizer/speechtokenizer_hubert_avg/config.json'
 ckpt_path = './SpeechTokenizer/speechtokenizer_hubert_avg/SpeechTokenizer.pt'
 speech_tokenizer = load_speech_tokenizer(config_path, ckpt_path, device)
-
 speech_tokenizer.eval()
-# Download and convert audio (if necessary)
+
 playlist_url = "https://www.youtube.com/watch?v=Lp7E973zozc&list=PLQltO7RlbjPJnbfHLsFJWP-DYnWPugUZ7"
 download_audio_from_playlist(playlist_url, 'audio/')
 audio_files = get_audio_files('audio', extension='.mp4')
@@ -62,54 +64,12 @@ for af in tqdm(audio_files):
 ##########################################
 # Create and Preprocess Dataset
 ##########################################
-print("Loading Dataset")
-audio_dataset = load_dataset("audiofolder", data_dir="./MarcBotClips")["train"]
-
-print("Normalizing waveforms")
-audio_dataset = audio_dataset.map(
-    lambda x: {
-        "original_sampling_rate": x["audio"]["sampling_rate"],
-        "audio_array": normalize_waveform(
-            torch.tensor(x["audio"]["array"]),
-            x["audio"]["sampling_rate"],
-            speech_tokenizer.sample_rate,
-        ),
-    },
-    remove_columns=["audio"],
-    writer_batch_size=15000,
+train_dataset, eval_dataset = process_audio_dataset(
+    data_dir="./MarcBotClips",
+    speech_tokenizer=speech_tokenizer,
+    length_of_clips=length_of_clips,
+    device=device,
 )
-
-print("Filtering dataset for correct clip length")
-target_sample_rate = speech_tokenizer.sample_rate
-target_clip_length = length_of_clips
-
-audio_dataset = audio_dataset.filter(
-    lambda batch: filter_audio_length(batch, target_sample_rate, target_clip_length),
-    batched=True,
-    batch_size=32, 
-    num_proc=1      
-)
-
-print("Tokenizing waveforms")
-audio_dataset = audio_dataset.map(
-    lambda x: {"tokens": tokenize_waveform(speech_tokenizer, torch.tensor(x["audio_array"]))},
-    remove_columns=["audio_array"],
-    writer_batch_size=15000,
-)
-
-os.makedirs("testfiles", exist_ok=True)
-for idx, t in enumerate(audio_dataset.select(range(0, 10))):
-    save_to_file(speech_tokenizer, torch.tensor(t["tokens"]).to(device), f"testfiles/{idx}_test.wav")
-
-audio_dataset = audio_dataset.with_format('torch')
-audio_dataset = audio_dataset.train_test_split(0.05)
-
-# Prepare token lists for dataset wrapping
-train_tokens = [ex["tokens"].squeeze(0) for ex in audio_dataset["train"]]
-eval_tokens  = [ex["tokens"].squeeze(0) for ex in audio_dataset["test"]]
-train_dataset = AudioTokenDataset(tokens_list=train_tokens)
-eval_dataset  = AudioTokenDataset(tokens_list=eval_tokens)
-
 ##########################################
 # Define Model Components
 ##########################################

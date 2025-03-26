@@ -10,6 +10,10 @@ import torch
 from torch.nn import  functional as F
 from mamba_ssm import Mamba
 import json
+from datasets import load_dataset
+
+
+
 with open("./config.json", "r") as f:
     config = json.load(f)
 
@@ -111,6 +115,68 @@ def convert_mp4_to_wav_clips(mp4_file, output_dir, clip_length=length_of_clips):
 
 def get_audio_files(directory, extension='.mp4'):
     return [os.path.join(directory, file) for file in os.listdir(directory) if file.endswith(extension)]
+
+def process_audio_dataset(
+    data_dir: str,
+    speech_tokenizer,
+    length_of_clips: float,
+    #device: str = "cpu",
+    save_examples: bool = True,
+    num_test_files: int = 10,
+    testfile_dir: str = "testfiles"
+):
+    device = speech_tokenizer.device
+
+    print("Loading Dataset")
+    audio_dataset = load_dataset("audiofolder", data_dir=data_dir)["train"]
+
+    print("Normalizing waveforms")
+    audio_dataset = audio_dataset.map(
+        lambda x: {
+            "original_sampling_rate": x["audio"]["sampling_rate"],
+            "audio_array": normalize_waveform(
+                torch.tensor(x["audio"]["array"]),
+                x["audio"]["sampling_rate"],
+                speech_tokenizer.sample_rate,
+            ),
+        },
+        remove_columns=["audio"],
+        writer_batch_size=15000,
+    )
+
+    print("Filtering dataset for correct clip length")
+    target_sample_rate = speech_tokenizer.sample_rate
+    target_clip_length = length_of_clips
+    audio_dataset = audio_dataset.filter(
+        lambda batch: filter_audio_length(batch, target_sample_rate, target_clip_length),
+        batched=True,
+        batch_size=32,
+        num_proc=1
+    )
+
+    print("Tokenizing waveforms")
+    audio_dataset = audio_dataset.map(
+        lambda x: {"tokens": tokenize_waveform(speech_tokenizer, torch.tensor(x["audio_array"]))},
+        remove_columns=["audio_array"],
+        writer_batch_size=15000,
+    )
+
+    if save_examples:
+        os.makedirs(testfile_dir, exist_ok=True)
+        for idx, t in enumerate(audio_dataset.select(range(0, num_test_files))):
+            save_to_file(speech_tokenizer, torch.tensor(t["tokens"]).to(device), f"{testfile_dir}/{idx}_test.wav")
+
+    audio_dataset = audio_dataset.with_format("torch")
+    audio_dataset = audio_dataset.train_test_split(0.05)
+
+    # Prepare token lists
+    train_tokens = [ex["tokens"].squeeze(0) for ex in audio_dataset["train"]]
+    eval_tokens = [ex["tokens"].squeeze(0) for ex in audio_dataset["test"]]
+
+    train_dataset = AudioTokenDataset(tokens_list=train_tokens)
+    eval_dataset = AudioTokenDataset(tokens_list=eval_tokens)
+
+    return train_dataset, eval_dataset
 
 ##########################################
 # Dataset and Data Collator
