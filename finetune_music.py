@@ -13,6 +13,7 @@ import logging
 import pickle
 import soundfile as sf
 from tqdm import tqdm
+from torch.utils.data import DataLoader
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,15 +21,16 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser(description='Train GPTNeoX on music data with pretrained tokenizer')
 parser.add_argument('--dataset_path', type=str, default='ccmusic-database/song_structure', 
                     help='Path to the dataset')
-parser.add_argument('--model_name', type=str, default='EleutherAI/gpt-neo-125M', 
-                    help='Base model to fine-tune')
+parser.add_argument('--model_cfg', type=str, 
+                    help='Base model config')
 parser.add_argument('--tokenizer_name', type=str, default='facebook/encodec_24khz', 
                     help='Pretrained tokenizer to use (encodec, hubert, or other audio model)')
 parser.add_argument('--output_dir', type=str, default='./music_model_output', 
                     help='Output directory for model checkpoints')
 parser.add_argument('--batch_size', type=int, default=4, help='Training batch size')
 parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
-parser.add_argument('--num_train_epochs', type=int, default=3, help='Number of training epochs')
+parser.add_argument('--iters', type=int, default=1000, help='Number of batches in training.')
+parser.add_argument('--warmup_steps', type=int, default=100, help='Number of warmup steps')
 parser.add_argument('--tokenizer_type', type=str, default='encodec', 
                     choices=['encodec', 'hubert', 'wav2vec', 'vq_vae', 'wavtokenizer'],
                     help='Type of pretrained tokenizer to use')
@@ -49,6 +51,7 @@ def load_music_dataset(dataset_path):
     else:
         dataset = load_dataset(dataset_path)
     
+    dataset['train'] = dataset['train']
     logger.info(f"Dataset loaded with {len(dataset['train'])} training examples")
     return dataset
 
@@ -102,40 +105,34 @@ class PretrainedAudioTokenizer:
         elif tokenizer_type == 'wavtokenizer':
             # For novateur/WavTokenizer
             # Parse args.tokenizer_name as "config_path,model_path"
-            try:
-                config_path, model_path = tokenizer_name.split(',')
+            config_path, model_path = tokenizer_name.split(',')
 
-                os.chdir('WavTokenizer')
-                from decoder.pretrained import WavTokenizer
-                self.model = WavTokenizer.from_pretrained0802(config_path, model_path)
-                self.model = self.model.to(self.device)
-                self.model.eval()
-                
-                # Import the audio conversion utility
-                from encoder.utils import convert_audio
-                os.chdir('..')
+            # os.chdir('./WavTokenizer')
+            from decoder.pretrained import WavTokenizer
+            self.model = WavTokenizer.from_pretrained0802(config_path, model_path)
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            
+            # Import the audio conversion utility
+            from encoder.utils import convert_audio
+            # os.chdir('..')
 
-                self.convert_audio = convert_audio
-                
-                logger.info(f"Loaded WavTokenizer model from {model_path}")
-                # Default bandwidth_id (can be made configurable)
-                self.bandwidth_id = torch.tensor([0]).to(self.device)
-            except Exception as e:
-                logger.error(f"Error loading WavTokenizer: {e}")
-                raise ValueError(f"Failed to load WavTokenizer. Check config and model paths: {e}")
-        
+            self.convert_audio = convert_audio
+            
+            logger.info(f"Loaded WavTokenizer model from {model_path}")
+            # Default bandwidth_id (can be made configurable)
+            self.bandwidth_id = torch.tensor([0]).to(self.device)
         else:
             raise ValueError(f"Unknown tokenizer type: {tokenizer_type}")
         
         # For GPT training, we need a text tokenizer for the output format
-        self.text_tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         
         # Get the vocabulary size from the model
         if tokenizer_type == 'wavtokenizer':
             # WavTokenizer typically has a different vocabulary size concept
             # This would need to be determined from the model configuration
             # For now, using a default value based on typical codebook sizes
-            self.vocab_size = 2048  # Can be adjusted based on specific WavTokenizer configuration
+            self.vocab_size = 4096  # Can be adjusted based on specific WavTokenizer configuration
         elif hasattr(self.model, 'config') and hasattr(self.model.config, 'vocab_size'):
             self.vocab_size = self.model.config.vocab_size
         else:
@@ -254,7 +251,7 @@ class PretrainedAudioTokenizer:
                         tokens = all_tokens
                     else:
                         # Single codebook case
-                        tokens = discrete_code.flatten().cpu().tolist()
+                        tokens = discrete_code
                 except Exception as e:
                     logger.error(f"Error in WavTokenizer processing: {e}")
                     # Fallback to a simple approach
@@ -276,7 +273,7 @@ class PretrainedAudioTokenizer:
             # Cache the result
             with open(cache_file, 'wb') as f:
                 pickle.dump(tokens, f)
-                
+            
             return tokens
 
     def decode_audio(self, tokens):
@@ -322,7 +319,8 @@ class PretrainedAudioTokenizer:
                 else:
                     # Otherwise try to reconstruct features first
                     # This is a simplification and may not work directly
-                    features = self.model.features_from_tokens(tokens_tensor)
+                    features = self.model.codes_to_features(tokens_tensor)
+
                     audio_out = self.model.decode(features, bandwidth_id=self.bandwidth_id)
                 
                 return audio_out.squeeze().cpu().numpy()
@@ -343,15 +341,22 @@ def prepare_dataset_for_training(dataset, tokenizer, args):
         tokenized_inputs = []
         attention_masks = []
         
-        for audio in tqdm(examples["audio"], desc="Tokenizing"):
-            tokens = tokenizer.tokenize_audio(audio)
-            tokenized_inputs.append(tokens)
-            attention_masks.append([1] * len(tokens))
+        # attention_masks = torch.ones_like(codes)
+        for audio in examples["audio"]:
+            # tokens = tokenizer.tokenize_audio(audio)
+            # tokenized_inputs.append(tokens)
+            # attention_masks.append([1] * len(tokens))
+            wav, sr = audio['array'], audio['sampling_rate']
+            wav = torch.tensor(wav).unsqueeze(0).to(torch.float32)
+            wav = tokenizer.convert_audio(wav, sr, 24000, 1).to(tokenizer.device)
+            _, codes = tokenizer.model.encode_infer(wav, bandwidth_id=tokenizer.bandwidth_id)
+            tokenized_inputs.append(codes)
+            attention_masks.append([1] * len(codes))
         
         # Prepare the output format for the model
         result = {
             "input_ids": tokenized_inputs,
-            "attention_mask": attention_masks
+            "attention_mask": attention_masks,
         }
         return result
     
@@ -360,11 +365,23 @@ def prepare_dataset_for_training(dataset, tokenizer, args):
         tokenize_function,
         batched=True,
         batch_size=16,
-        num_proc=4
     )
     
     return tokenized_dataset
 
+def collate_fn(batch):
+    
+    min_l = min([len(b['input_ids'][0][0]) for b in batch])
+    logger.info(min_l)
+    assert all([torch.tensor(b['input_ids']).shape[:2] == (1, 1) for b in batch])
+    input_ids = [torch.tensor(b['input_ids'])[0, 0, :min_l] for b in batch]
+    input_ids = torch.stack(input_ids, dim=0)
+    labels = input_ids
+
+    return dict(
+        input_ids=input_ids,
+        labels=labels
+    )
 def evaluate_tokenizer_quality(dataset, tokenizer, args):
     """Evaluate the quality of tokenization by reconstruction when possible"""
     logger.info(f"Evaluating {args.tokenizer_type} tokenizer quality...")
@@ -394,7 +411,7 @@ def evaluate_tokenizer_quality(dataset, tokenizer, args):
             # Calculate reconstruction error
             # Make sure lengths match
             min_len = min(len(original_audio), len(reconstructed_audio))
-            original_trim = original_audio[:min_len]
+            original_trim = original_audio['array'][:min_len]
             reconstructed_trim = reconstructed_audio[:min_len]
             
             # Calculate metrics
@@ -426,24 +443,26 @@ def evaluate_tokenizer_quality(dataset, tokenizer, args):
 
 def train_model(tokenized_dataset, tokenizer, args):
     """Train the GPTNeoX model"""
+
+    # train_dataloader = DataLoader(tokenized_dataset['train'], collate_fn=collate_fn, batch_size=1)
     logger.info("Initializing model for training...")
     
     # Initialize wandb for tracking
     wandb.init(project="music-generation", name=f"gptneox-{args.tokenizer_type}")
     
     # Define model configuration
-    config = GPTNeoXConfig.from_pretrained(args.model_name)
+    config = GPTNeoXConfig.from_pretrained(args.model_cfg)
     # Set vocabulary size based on tokenizer
     config.vocab_size = tokenizer.vocab_size
     
     # Initialize model
-    model = GPTNeoXForCausalLM.from_pretrained(args.model_name, config=config)
+    model = GPTNeoXForCausalLM(config=config)
     
     # Define training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         overwrite_output_dir=True,
-        num_train_epochs=args.num_train_epochs,
+        max_steps=args.iters,
         per_device_train_batch_size=args.batch_size,
         save_steps=500,
         save_total_limit=2,
@@ -453,13 +472,16 @@ def train_model(tokenized_dataset, tokenizer, args):
         weight_decay=0.01,
         fp16=True,
         report_to="wandb",
+        warmup_steps=args.warmup_steps,
+        lr_scheduler_type="linear",
     )
     
     # Initialize trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset["train"],
+        train_dataset=tokenized_dataset['train'],
+        data_collator=collate_fn
     )
     
     # Train model
@@ -524,18 +546,19 @@ def main():
     train_model(tokenized_dataset, tokenizer, args)
     
     # Example of generating new music (would run after training)
-    if os.path.exists(f"{args.output_dir}/{args.tokenizer_type}"):
-        logger.info("Loading trained model for music generation...")
-        model = GPTNeoXForCausalLM.from_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
+    # if os.path.exists(f"{args.output_dir}/{args.tokenizer_type}"):
+    #     logger.info("Loading trained model for music generation...")
+    #     model = GPTNeoXForCausalLM.from_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
         
-        # Generate a sample
-        sample_audio = dataset['train'][0]['audio'][:5000]  # Use first 5000 samples as prompt
-        generated_audio, _ = generate_music(model, tokenizer, prompt=sample_audio)
+    #     # Generate a sample
+    #     sample_audio = dataset['train'][0]['audio']
+    #     sample_audio['array'] = sample_audio['array'][:5000]  # Use first 5000 samples as prompt
+    #     generated_audio, _ = generate_music(model, tokenizer, prompt=sample_audio)
         
-        if generated_audio is not None:
-            os.makedirs("./generated", exist_ok=True)
-            sf.write("./generated/sample.wav", generated_audio, args.sample_rate)
-            logger.info("Generated sample saved to ./generated/sample.wav")
+    #     if generated_audio is not None:
+    #         os.makedirs("./generated", exist_ok=True)
+    #         sf.write("./generated/sample.wav", generated_audio, args.sample_rate)
+    #         logger.info("Generated sample saved to ./generated/sample.wav")
     
     logger.info("Process complete!")
 
