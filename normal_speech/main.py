@@ -1,17 +1,16 @@
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import Trainer, TrainingArguments
+from transformers import Trainer, TrainingArguments, AutoModelForCausalLM, AutoConfig
+
 import wandb
 from tqdm import tqdm
 import json
 
-
-
-
-# Import utility functions and classes
 from utils import (
     load_speech_tokenizer,
     normalize_waveform,
@@ -20,6 +19,7 @@ from utils import (
     process_audio_dataset,
     convert_mp4_to_wav_clips,
     download_audio_from_playlist,
+    load_and_preprocess_dataset,
     AudioTokenDataset,
     data_collator,
     save_to_file,
@@ -29,6 +29,8 @@ from utils import (
     MambaAudioModel,
     HFModelWrapper,
     filter_audio_length,
+    initialize_model,
+    evaluate_and_generate_audio
 )
 
 #############################
@@ -36,53 +38,20 @@ from utils import (
 #############################
 device = torch.device("cuda")
 with open("./config.json", "r") as f:
-    config = json.load(f)
+        config = json.load(f)
 
-n_embed = config["n_embed"]
-n_heads = config["n_heads"]
-n_layers = config["n_layers"]
-dropout = config["dropout"]
-vocab_size = config["vocab_size"]
-sample_rate = config["sample_rate"]
 length_of_clips = config["length_of_clips"]
-block_size = config["block_size"]
-epochs = config["epochs"]
-lr = config["learning_rate"]
-
-NUM_QUANTIZERS_USED = 4
-
-##########################################
-# Load SpeechTokenizer and Process Audio
-##########################################
-# Update these paths as needed
+#Load dataset
 config_path = './SpeechTokenizer/speechtokenizer_hubert_avg/config.json'
 ckpt_path = './SpeechTokenizer/speechtokenizer_hubert_avg/SpeechTokenizer.pt'
 speech_tokenizer = load_speech_tokenizer(config_path, ckpt_path, device)
 speech_tokenizer.eval()
 
-playlist_url = "https://www.youtube.com/watch?v=Lp7E973zozc&list=PLQltO7RlbjPJnbfHLsFJWP-DYnWPugUZ7"
-download_audio_from_playlist(playlist_url, 'audio/')
-audio_files = get_audio_files('audio', extension='.mp4')
-for af in tqdm(audio_files):
-    convert_mp4_to_wav_clips(af, 'MarcBotClips', length_of_clips)
+url = 'https://www.youtube.com/watch?v=a7fzkqLozwA&list=PLnuc7k2Czju3daT5xsUrli-cmGxQEU08H'#"https://www.youtube.com/watch?v=Lp7E973zozc&list=PLQltO7RlbjPJnbfHLsFJWP-DYnWPugUZ7"
+train_dataset, eval_dataset = load_and_preprocess_dataset(config, speech_tokenizer, device)#, playlist_url= url)
 
-##########################################
-# Create and Preprocess Dataset
-##########################################
-train_dataset, eval_dataset = process_audio_dataset(
-    data_dir="./MarcBotClips",
-    speech_tokenizer=speech_tokenizer,
-    length_of_clips=length_of_clips,
-    device=device,
-)
-##########################################
-# Define Model Components
-##########################################
-
-
-model_original = MambaAudioModel()
-model = HFModelWrapper(model_original)
-model.to(device)
+model_name = 'mamba'  # [mamba, gptneox, armt]
+model = initialize_model(model_name, config)
 
 ##########################################
 # Setup Hugging Face Trainer
@@ -119,30 +88,6 @@ trainer = Trainer(
 print("Starting training...")
 trainer.train()
 
-print("Evaluating on test dataset...")
-eval_results = trainer.evaluate()
-print("Evaluation Metrics:", eval_results)
 
-##########################################
-# Generate Audio Samples from Evaluation
-##########################################
-
-num_samples_to_generate = 2  # for example, generate 2 audio outputs
-os.makedirs("generated_audio", exist_ok=True)
-
-for i in range(num_samples_to_generate):
-    example_tokens = eval_dataset[i]["tokens"]
-    gen_filename = f"generated_audio/eval_sample_{i}"
-    print(f"Generating audio for sample {i}...")
-    produce_wav(
-        speech_tokenizer, 
-        gen_filename, 
-        model, 
-        example_tokens, 
-        block_size, 
-        device,
-        wandb_obj=wandb  
-
-
-    )
+evaluate_and_generate_audio(trainer, eval_dataset, speech_tokenizer, config["block_size"], device)
 wandb.finish()

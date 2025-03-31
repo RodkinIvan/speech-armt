@@ -178,6 +178,21 @@ def process_audio_dataset(
 
     return train_dataset, eval_dataset
 
+def load_and_preprocess_dataset(config, speech_tokenizer, device, playlist_url = None):
+    #playlist_url = "https://www.youtube.com/watch?v=Lp7E973zozc&list=PLQltO7RlbjPJnbfHLsFJWP-DYnWPugUZ7"
+    if playlist_url:
+        download_audio_from_playlist(playlist_url, 'audio/')
+        audio_files = get_audio_files('audio', extension='.mp4')
+        for af in tqdm(audio_files):
+            convert_mp4_to_wav_clips(af, 'MarcBotClips', config["length_of_clips"])
+    
+    train_dataset, eval_dataset = process_audio_dataset(
+        data_dir="./MarcBotClips",
+        speech_tokenizer=speech_tokenizer,
+        length_of_clips=config["length_of_clips"],
+        #device=device,
+    )
+    return train_dataset, eval_dataset
 ##########################################
 # Dataset and Data Collator
 ##########################################
@@ -208,6 +223,36 @@ def data_collator(batch):
 ##########################################
 # Audio Generation Utility
 ##########################################
+
+def initialize_model(model_name, config, block_size=2000, n_segments=2):
+    if model_name == 'mamba':
+        model_original = MambaAudioModel()
+        model = HFModelWrapper(model_original)
+    elif model_name == 'gptneox':
+        base_config = AutoConfig.from_pretrained('./configs/gptneox.json')
+        base_model = AutoModelForCausalLM.from_config(base_config)
+        model = base_model
+    elif model_name == 'armt':
+        import sys
+        sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
+        from armt.model import AssociativeMemoryCell, AssociativeRecurrentWrapper
+        base_config = AutoConfig.from_pretrained('./configs/gptneox.json')
+        base_model = AutoModelForCausalLM.from_config(base_config)
+        mem_cell_args = dict(
+            num_mem_tokens=16, 
+            d_mem=64, 
+            layers_attr="gpt_neox.layers",
+        )
+        rmt_config = dict(segment_size=block_size // n_segments, max_n_segments=n_segments)
+        model = AssociativeRecurrentWrapper(
+            AssociativeMemoryCell(base_model, **mem_cell_args),
+            **rmt_config
+        )
+    else:
+        raise ValueError(f"Unsupported model_name: {model_name}")
+    return model.to(device)
+
+
 def produce_wav(speech_tokenizer, filename, model, example, block_size, device, wandb_obj=None):
     """
     Generate audio autoregressively from a token sequence.
@@ -243,6 +288,25 @@ def produce_wav(speech_tokenizer, filename, model, example, block_size, device, 
         wandb_obj.save(f"{filename}_test.wav")
         wandb_obj.save(f"{filename}_input.wav")
 
+def evaluate_and_generate_audio(trainer, eval_dataset, speech_tokenizer, block_size, device, num_samples=2):
+    print("Evaluating on test dataset...")
+    eval_results = trainer.evaluate()
+    print("Evaluation Metrics:", eval_results)
+
+    os.makedirs("generated_audio", exist_ok=True)
+    for i in range(num_samples):
+        example_tokens = eval_dataset[i]["tokens"]
+        gen_filename = f"generated_audio/eval_sample_{i}"
+        print(f"Generating audio for sample {i}...")
+        produce_wav(
+            speech_tokenizer, 
+            gen_filename, 
+            trainer.model, 
+            example_tokens, 
+            block_size, 
+            device,
+            wandb_obj=wandb
+        )
 
 class FeedForward(nn.Module):
     def __init__(self, n_embed):
