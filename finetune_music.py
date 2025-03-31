@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser(description='Train GPTNeoX on music data with pretrained tokenizer')
-parser.add_argument('--dataset_path', type=str, default='ccmusic-database/song_structure', 
+parser.add_argument('--dataset_path', type=str, default='irodkin/song_structure_with_test', 
                     help='Path to the dataset')
 parser.add_argument('--model_cfg', type=str, 
                     help='Base model config')
@@ -51,7 +51,6 @@ def load_music_dataset(dataset_path):
     else:
         dataset = load_dataset(dataset_path)
     
-    dataset['train'] = dataset['train']
     logger.info(f"Dataset loaded with {len(dataset['train'])} training examples")
     return dataset
 
@@ -468,6 +467,8 @@ def train_model(tokenized_dataset, tokenizer, args):
         save_total_limit=2,
         logging_dir="./logs",
         logging_steps=100,
+        evaluation_strategy="steps", 
+        eval_steps=500,
         learning_rate=args.learning_rate,
         weight_decay=0.01,
         fp16=True,
@@ -481,6 +482,7 @@ def train_model(tokenized_dataset, tokenizer, args):
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset['train'],
+        eval_dataset=tokenized_dataset['validation'],
         data_collator=collate_fn
     )
     
