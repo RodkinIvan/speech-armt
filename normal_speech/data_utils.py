@@ -127,14 +127,7 @@ def process_audio_dataset(data_dir, speech_tokenizer, device, length_of_clips,
     audio_dataset = audio_dataset.with_format("torch").train_test_split(0.05)
     train_tokens = [ex["tokens"].squeeze(0) for ex in audio_dataset["train"]]
     eval_tokens = [ex["tokens"].squeeze(0) for ex in audio_dataset["test"]]
-    from torch.utils.data import Dataset
-    class AudioTokenDataset(Dataset):
-        def __init__(self, tokens_list):
-            self.tokens_list = tokens_list
-        def __len__(self):
-            return len(self.tokens_list)
-        def __getitem__(self, idx):
-            return {"tokens": self.tokens_list[idx]}
+
     return AudioTokenDataset(train_tokens), AudioTokenDataset(eval_tokens)
 
 def load_and_preprocess_dataset(config, speech_tokenizer, device, playlist_url=None):
@@ -145,54 +138,101 @@ def load_and_preprocess_dataset(config, speech_tokenizer, device, playlist_url=N
             convert_mp4_to_wav_clips(af, 'MarcBotClips', config["length_of_clips"])
     return process_audio_dataset("./MarcBotClips", speech_tokenizer, device, config["length_of_clips"])
 
+def load_sample_data(dataset_name='parler-tts/mls_eng', train_samples=500, dev_samples=50, test_samples=5, speech_tokenizer=None):
+    from datasets import load_dataset
+    import itertools
+    import torch
+
+    # Load the dataset splits as streaming datasets.
+    train_stream = load_dataset(dataset_name, split="train", streaming=True)
+    dev_stream = load_dataset(dataset_name, split="dev", streaming=True)
+    test_stream = load_dataset(dataset_name, split="test", streaming=True)
+
+    # Select the desired number of examples using islice.
+    train_subset = list(itertools.islice(train_stream, train_samples))
+    dev_subset = list(itertools.islice(dev_stream, dev_samples))
+    test_subset = list(itertools.islice(test_stream, test_samples))
+
+    # Function to process each sample.
+    def process_sample(sample):
+        audio_info = sample['audio']
+        # Convert the audio array to float32.
+        arr = torch.tensor(audio_info['array']).float()
+        sr = audio_info['sampling_rate']
+        # Normalize waveform (this function should return a tensor in float32).
+        normalized = normalize_waveform(arr, sr, speech_tokenizer.sample_rate)
+        # Tokenize the normalized waveform.
+        tokens = tokenize_waveform(speech_tokenizer, normalized)
+        return {"tokens": tokens}
+
+    processed_train = [process_sample(s) for s in train_subset]
+    processed_dev = [process_sample(s) for s in dev_subset]
+    processed_test = [process_sample(s) for s in test_subset]
+
+    return processed_train, processed_dev, processed_test
+
+
+# def data_collator(batch):
+#     tokens = [item["tokens"] for item in batch]
+#     batch_max_len = max([t.size(0) for t in tokens])
+#     padded_tokens = []
+#     for t in tokens:
+#         pad_length = batch_max_len - t.size(0)
+#         if pad_length > 0:
+#             t = torch.cat([t, torch.zeros(pad_length, dtype=t.dtype)], dim=0)
+#         padded_tokens.append(t)
+#     padded_tokens = torch.stack(padded_tokens)  # (B, T)
+#     input_ids = padded_tokens[:, :-1].contiguous()
+#     labels = padded_tokens[:, 1:].contiguous()
+#     return {"input_ids": input_ids, "labels": labels}
+
 def data_collator(batch):
+    # Get token tensors from the batch.
     tokens = [item["tokens"] for item in batch]
-    batch_max_len = max([t.size(0) for t in tokens])
+    tokens_2d = [t.unsqueeze(0) if t.ndim == 1 else t for t in tokens]
+    
+    batch_max_len = max(t.size(1) for t in tokens_2d)
+    
     padded_tokens = []
-    for t in tokens:
-        pad_length = batch_max_len - t.size(0)
+    for t in tokens_2d:
+        pad_length = batch_max_len - t.size(1)
         if pad_length > 0:
-            t = torch.cat([t, torch.zeros(pad_length, dtype=t.dtype)], dim=0)
+            padding = torch.zeros(t.size(0), pad_length, dtype=t.dtype)
+            t = torch.cat([t, padding], dim=1)
         padded_tokens.append(t)
-    padded_tokens = torch.stack(padded_tokens)  # (B, T)
+    
+    padded_tokens = torch.stack(padded_tokens).squeeze(1)
+    
     input_ids = padded_tokens[:, :-1].contiguous()
     labels = padded_tokens[:, 1:].contiguous()
     return {"input_ids": input_ids, "labels": labels}
 
 def produce_wav(speech_tokenizer, filename, model, example, block_size, device, wandb_obj=None):
-    """
-    Generate audio autoregressively from a token sequence.
-    
-    Args:
-      speech_tokenizer: The SpeechTokenizer instance.
-      filename: Base filename for saving output audio.
-      model: The generative model (wrapped for Trainer compatibility).
-      example: Token tensor of shape (T,). Generation starts from the first half.
-      block_size: Maximum context length used for generation.
-      device: Torch device.
-      wandb_obj: (Optional) WandB object for logging files.
-    
-    The function saves two files:
-      - <filename>_test.wav : The generated audio.
-      - <filename>_input.wav: The original input audio.
-    """
     first_half = example.shape[-1] // 2
-    tokens = example[:first_half].reshape(1, first_half)
+    if example.ndim == 1:
+        tokens = example.unsqueeze(0)
+    else:
+        tokens = example
+    tokens = tokens[:, :first_half]  # Slice along the sequence dimension
     max_new_tokens = example.shape[-1] - first_half
     idx = tokens.to(device)
     for _ in tqdm(range(max_new_tokens), desc="Generating audio"):
         idx_cond = idx[:, -block_size:]
         logits = model(idx_cond)
-        last_logits = logits["logits"][:, -1, :]#logits[:, -1, :]
+        last_logits = logits["logits"][:, -1, :]
         probs = torch.softmax(last_logits, dim=1)
         next_index = torch.multinomial(probs, num_samples=1)
         idx = torch.cat((idx, next_index), dim=1)
-    # Save generated audio and original input for comparison
     save_to_file(speech_tokenizer, idx, f"{filename}_test.wav")
-    save_to_file(speech_tokenizer, example.unsqueeze(0), f"{filename}_input.wav")
+    # Use the original example without unsqueezing if already 2D.
+    if example.ndim == 1:
+        save_to_file(speech_tokenizer, example.unsqueeze(0), f"{filename}_input.wav")
+    else:
+        save_to_file(speech_tokenizer, example, f"{filename}_input.wav")
     if wandb_obj is not None:
         wandb_obj.save(f"{filename}_test.wav")
         wandb_obj.save(f"{filename}_input.wav")
+
 
 
 def evaluate_and_generate_audio(trainer, eval_dataset, speech_tokenizer, block_size, device, wandb, num_samples=2):
@@ -214,3 +254,12 @@ def evaluate_and_generate_audio(trainer, eval_dataset, speech_tokenizer, block_s
             device,
             wandb_obj=wandb
         )
+
+from torch.utils.data import Dataset
+class AudioTokenDataset(Dataset):
+    def __init__(self, tokens_list):
+        self.tokens_list = tokens_list
+    def __len__(self):
+        return len(self.tokens_list)
+    def __getitem__(self, idx):
+        return {"tokens": self.tokens_list[idx]}

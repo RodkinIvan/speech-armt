@@ -3,13 +3,11 @@ import sys
 import argparse
 import json
 import torch
-from transformers import TrainingArguments, AutoConfig
 import wandb
+from transformers import TrainingArguments, AutoConfig
 from tqdm import tqdm
 
-sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
-
-from data_utils import load_speech_tokenizer, load_and_preprocess_dataset, data_collator, evaluate_and_generate_audio
+from data_utils import load_speech_tokenizer, load_and_preprocess_dataset, load_sample_data, data_collator, evaluate_and_generate_audio
 from model_utils import initialize_model
 from trainer_utils import CustomTrainer
 
@@ -19,10 +17,12 @@ def parse_args():
     parser.add_argument("--tokenizer_config", type=str, default="./SpeechTokenizer/speechtokenizer_hubert_avg/config.json", help="Path to speech tokenizer config")
     parser.add_argument("--tokenizer_ckpt", type=str, default="./SpeechTokenizer/speechtokenizer_hubert_avg/SpeechTokenizer.pt", help="Path to speech tokenizer checkpoint")
     parser.add_argument("--model_name", type=str, default="armt", choices=["mamba", "gptneox", "armt"], help="Model branch to use")
-    parser.add_argument("--playlist_url", type=str, default=None, help="Optional YouTube playlist URL to download audio")
-    parser.add_argument("--num_train_epochs", type=int, default=None, help="Number of training epochs (overrides config)")
-    parser.add_argument("--learning_rate", type=float, default=None, help="Learning rate (overrides config)")
-    parser.add_argument("--batch_size", type=int, default=None, help="Batch size for training and evaluation (overrides config)")
+    parser.add_argument("--playlist_url", type=str, default=None, help="Optional YouTube playlist URL for audio download")
+    parser.add_argument("--use_sample_data", action="store_true", help="If set, load a partial HF dataset instead of local files")
+    parser.add_argument("--dataset_name", type=str, default="parler-tts/mls_eng", help="HF dataset name to load sample data from")
+    parser.add_argument("--train_samples", type=int, default=500, help="Number of training samples to load")
+    parser.add_argument("--dev_samples", type=int, default=50, help="Number of dev samples to load")
+    parser.add_argument("--test_samples", type=int, default=5, help="Number of test samples to load")
     return parser.parse_args()
 
 def main():
@@ -31,26 +31,31 @@ def main():
     with open(args.config_path, "r") as f:
         config = json.load(f)
     
-    if args.num_train_epochs is not None:
-        config["epochs"] = args.num_train_epochs
-    if args.learning_rate is not None:
-        config["learning_rate"] = args.learning_rate
-    if args.batch_size is not None:
-        config["per_device_train_batch_size"] = args.batch_size
-        config["per_device_eval_batch_size"] = args.batch_size
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     length_of_clips = config["length_of_clips"]
 
     speech_tokenizer = load_speech_tokenizer(args.tokenizer_config, args.tokenizer_ckpt, device)
     speech_tokenizer.eval()
 
-    train_dataset, eval_dataset = load_and_preprocess_dataset(config, speech_tokenizer, device, playlist_url=args.playlist_url)
+    if args.use_sample_data:
+        train_data, dev_data, test_data = load_sample_data(
+            dataset_name=args.dataset_name,
+            train_samples=args.train_samples,
+            dev_samples=args.dev_samples,
+            test_samples=args.test_samples,
+            speech_tokenizer=speech_tokenizer
+        )
+        eval_data = dev_data + test_data
+        from data_utils import AudioTokenDataset
+        train_dataset = AudioTokenDataset([d["tokens"] for d in train_data])
+        eval_dataset = AudioTokenDataset([d["tokens"] for d in eval_data])
+    else:
+        train_dataset, eval_dataset = load_and_preprocess_dataset(config, speech_tokenizer, device, playlist_url=args.playlist_url)
 
+    # Initialize model
     model = initialize_model(args.model_name, config)
 
     wandb.init(project="speech_test")
-
     training_args = TrainingArguments(
         output_dir="checkpoints",
         num_train_epochs=config['epochs'],
@@ -67,7 +72,6 @@ def main():
         remove_unused_columns=False
     )
 
-
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -79,9 +83,10 @@ def main():
     print("Starting training...")
     trainer.train()
 
-    # Evaluate and generate audio examples
     evaluate_and_generate_audio(trainer, eval_dataset, speech_tokenizer, config["block_size"], device, wandb=wandb.run)
     wandb.finish()
 
 if __name__ == "__main__":
     main()
+
+#test case for load dataset from HF: python main.py --use_sample_data --dataset_name "parler-tts/mls_eng" --train_samples 5 --dev_samples 2 --test_samples 1
