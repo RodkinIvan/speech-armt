@@ -1,5 +1,6 @@
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="${PYTHONPATH}:./WavTokenizer"
+export HF_Trainer=1
 
 NP=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
 
@@ -10,14 +11,22 @@ ITERS=10000
 MAX_LENGTH=8192
 LR=1e-4
 TBS=32
-BS=16
+
+BS=4
+
+MEMORY_SIZE=32
+D_MEM=64
+SEGMENT_SIZE=1024
+
+N=2
 
 GRAD_ACC_STEPS=$((TBS/BS))
 
 MODEL_CFG=./configs/gptneox_small.json
 cd ../..
-accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_process_port 29501 finetune_music.py \
+accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_process_port $((29500+$N)) finetune_music.py \
     --model_cfg $MODEL_CFG \
+    --model_name armt \
     --tokenizer_type wavtokenizer \
     --tokenizer_name $CONFIG_PATH,$MODEL_PATH \
     --iters $ITERS \
@@ -25,4 +34,8 @@ accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_pr
     --learning_rate $LR \
     --batch_size $BS \
     --warmup_steps 100 \
+    --num_mem_tokens $MEMORY_SIZE \
+    --d_mem $D_MEM \
+    --segment_size $SEGMENT_SIZE \
     --gradient_accumulation_steps $GRAD_ACC_STEPS
+
