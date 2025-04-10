@@ -1,7 +1,7 @@
 import math
 import torch
 from torch.nn import CrossEntropyLoss
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions, CausalLMOutputWithPast
 from torch.nn.functional import relu as r
 import torch.nn.functional as F
 import wandb
@@ -537,8 +537,8 @@ class AssociativeMemoryCell(torch.nn.Module):
             seg_kwargs['attention_mask'] = self.pad_attention_mask(kwargs['attention_mask'], inputs_embeds.shape)
             if kwargs.get('prev_attn_mask') is not None:
                 seg_kwargs['attention_mask'] = torch.cat([kwargs['prev_attn_mask'], seg_kwargs['attention_mask']], dim=-1)
-            if 'prev_attn_mask' in seg_kwargs:
-                seg_kwargs.pop('prev_attn_mask')
+        if 'prev_attn_mask' in seg_kwargs:
+            seg_kwargs.pop('prev_attn_mask')
         seg_kwargs['output_hidden_states'] = True
 
         if self.wrap_pos:
@@ -679,8 +679,9 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
                 output_hidden_states=None,
                 input_segmented=False,
                 output_only_last_segment=False,
-                use_previous_batch_state=torch.zeros(1)
-                ):
+                use_previous_batch_state=torch.zeros(1),
+                return_loss=True # for huggingface trainer to understand that model can return loss
+            ):
         sliding_window = self.rmt_config['sliding_window'] if 'sliding_window' in self.rmt_config else False
         if input_segmented:
             n_segs = input_ids.shape[1] if not (input_ids is None) else inputs_embeds.shape[1]
@@ -742,6 +743,7 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
         if not self.training:
             self.memory_cell.zero_mem()
             self.last_state = None
+        # assert 'loss' in out and out['loss'] is not None, "No loss in output"
         return out
 
     def segment(self, **kwargs):
@@ -774,7 +776,7 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
         return segments
 
     def process_outputs(self, cell_outputs, **kwargs):
-        out = CausalLMOutputWithCrossAttentions()
+        out = Munch()
         full_logits = torch.cat([o.logits for o in cell_outputs], dim=1)
         
         labels = kwargs.get('labels')
@@ -797,6 +799,7 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
             out['loss'] = loss_fct(flat_logits, flat_labels)
         else:
             out['loss'] = 0 
+        out.loss = out['loss']
         if ('HF_Trainer' not in os.environ) or not os.environ['HF_Trainer']:
             out['ce_loss'] = out['loss']
         
@@ -831,8 +834,12 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
           out['remainders'] = remainders.detach().cpu()
           time_penalty = self.rmt_config['time_penalty']
           out['loss'] = out['loss'] + time_penalty * remainders
-        
-        return out 
+        return CausalLMOutputWithPast(
+            loss=out.get('loss'),
+            logits=out.get('logits'),
+            hidden_states=out.get('hidden_states'),
+            attentions=out.get('attentions'),
+        )
         
     def manage_gradients(self, memory_state, seg_num):
         k2, max_n_segments = self.rmt_config.get('k2'), self.rmt_config.get('max_n_segments')
