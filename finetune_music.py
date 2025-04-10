@@ -14,6 +14,8 @@ import pickle
 import soundfile as sf
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from armt.model import AssociativeMemoryCell, AssociativeRecurrentWrapper
+from transformers.integrations import WandbCallback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,6 +41,14 @@ parser.add_argument('--max_length', type=int, default=1024, help='Maximum sequen
 parser.add_argument('--cache_dir', type=str, default='./tokenizer_cache', 
                     help='Directory to cache tokenized features')
 parser.add_argument('--evaluate_only', action='store_true', help='Only evaluate tokenizer performance')
+parser.add_argument('--model_name', type=str, default='gptneox', 
+                    help='Model name from [gptneox, armt, mamba]')
+
+parser.add_argument('--num_mem_tokens', type=int, default=16, help='armt parameter')
+parser.add_argument('--d_mem', type=int, default=32, help='armt parameter')
+parser.add_argument('--segment_size', type=int, default=1024, help='armt parameter')
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
+parser.add_argument('input_segment_borders', action='store_true', help='Input segment borders for training')
 args = parser.parse_args()
 
 def load_music_dataset(dataset_path):
@@ -51,6 +61,11 @@ def load_music_dataset(dataset_path):
     else:
         dataset = load_dataset(dataset_path)
     
+    # dataset['train'] = dataset['train'].select(range(64))
+    # dataset['validation'] = dataset['validation'].select(range(1))
+    # dataset['test'] = dataset['test'].select(range(1))
+
+    assert 'validation' in dataset
     logger.info(f"Dataset loaded with {len(dataset['train'])} training examples")
     return dataset
 
@@ -440,6 +455,38 @@ def evaluate_tokenizer_quality(dataset, tokenizer, args):
     
     return df
 
+def load_model(model_name, tokenizer):
+    if model_name == 'gptneox':
+        config = GPTNeoXConfig.from_pretrained(args.model_cfg)
+        config.vocab_size = tokenizer.vocab_size
+        model = GPTNeoXForCausalLM(config=config)
+        return model
+    elif model_name == 'armt':
+        config = GPTNeoXConfig.from_pretrained(args.model_cfg)
+        config.vocab_size = tokenizer.vocab_size
+        base_model = GPTNeoXForCausalLM(config=config)
+        # Initialize ARMT model
+        mem_cell_args = dict(
+            base_model=base_model,
+            num_mem_tokens=args.num_mem_tokens,
+            d_mem=args.d_mem, 
+            layers_attr="gpt_neox.layers",
+        )
+        memory_cell = AssociativeMemoryCell(**mem_cell_args)
+
+        model = AssociativeRecurrentWrapper(
+            memory_cell=memory_cell,
+            segment_size=args.segment_size,
+        )
+        return model
+    
+
+def get_trainer_wandb_run(trainer):
+    for callback in trainer.callback_handler.callbacks:
+        if isinstance(callback, WandbCallback):
+            return callback._wandb
+    return None
+
 def train_model(tokenized_dataset, tokenizer, args):
     """Train the GPTNeoX model"""
 
@@ -447,18 +494,14 @@ def train_model(tokenized_dataset, tokenizer, args):
     logger.info("Initializing model for training...")
     
     # Initialize wandb for tracking
-    wandb.init(project="music-generation", name=f"gptneox-{args.tokenizer_type}")
+    wandb.init(project="music-generation", name=f"{args.model_name}-{args.tokenizer_type}")
     
     # Define model configuration
-    config = GPTNeoXConfig.from_pretrained(args.model_cfg)
-    # Set vocabulary size based on tokenizer
-    config.vocab_size = tokenizer.vocab_size
-    
-    # Initialize model
-    model = GPTNeoXForCausalLM(config=config)
+    model = load_model(args.model_name, tokenizer)
     
     # Define training arguments
     training_args = TrainingArguments(
+        do_eval=True,
         output_dir=args.output_dir,
         overwrite_output_dir=True,
         max_steps=args.iters,
@@ -467,32 +510,75 @@ def train_model(tokenized_dataset, tokenizer, args):
         save_total_limit=2,
         logging_dir="./logs",
         logging_steps=100,
-        evaluation_strategy="steps", 
-        eval_steps=500,
+        eval_strategy="steps", 
+        eval_steps=100,
         learning_rate=args.learning_rate,
         weight_decay=0.01,
-        fp16=True,
         report_to="wandb",
         warmup_steps=args.warmup_steps,
         lr_scheduler_type="linear",
+        save_safetensors=False,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
-    
+    assert len(tokenized_dataset['validation']) > 0
     # Initialize trainer
+    from transformers import TrainerCallback
+
+    class ForceEvalLossCallback(TrainerCallback):
+        def __init__(self, trainer, eval_dataset=None):
+            super().__init__()
+            
+            self.eval_dataset = eval_dataset
+            self.trainer_ref = trainer
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            if self.eval_dataset is None or self.trainer_ref is None:
+                return
+
+            dataloader = self.trainer_ref.get_eval_dataloader(self.eval_dataset)
+            model = self.trainer_ref.model
+            model.eval()
+
+            total_loss = 0
+            total_samples = 0
+
+            for batch in dataloader:
+                for k, v in batch.items():
+                    batch[k] = v.to(args.device)
+
+                with torch.no_grad():
+                    outputs = model(**batch)
+                loss_tensor = outputs.get("ce_loss", outputs.loss)
+                batch_size = batch["input_ids"].size(0)
+                total_loss += loss_tensor.item() * batch_size
+                total_samples += batch_size
+
+            avg_loss = total_loss / total_samples
+            print(f"Forced eval loss: {avg_loss}")
+            get_trainer_wandb_run(self.trainer_ref).log({"eval/loss_forced": avg_loss})
+
+            # Inject it into the trainer logs so it shows up in the metrics
+            if kwargs.get("metrics") is not None:
+                kwargs["metrics"]["eval_loss_forced"] = avg_loss
+
+            return control
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset['train'],
         eval_dataset=tokenized_dataset['validation'],
-        data_collator=collate_fn
+        data_collator=collate_fn,
     )
-    
+    trainer.add_callback(ForceEvalLossCallback(trainer, tokenized_dataset['validation']))
     # Train model
     logger.info("Starting model training...")
+    metrics = trainer.evaluate()
+    print(metrics)
     trainer.train()
     
     # Save model
-    model.save_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
-    logger.info(f"Model saved to {args.output_dir}/{args.tokenizer_type}")
+    # model.save_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
+    # logger.info(f"Model saved to {args.output_dir}/{args.tokenizer_type}")
     
     # Close wandb run
     wandb.finish()
@@ -533,9 +619,6 @@ def main():
     
     # Initialize tokenizer
     tokenizer = PretrainedAudioTokenizer(args.tokenizer_type, args.tokenizer_name, args)
-    
-    # Evaluate tokenizer quality
-    tokenizer_metrics = evaluate_tokenizer_quality(dataset, tokenizer, args)
     
     if args.evaluate_only:
         logger.info("Tokenizer evaluation complete. Exiting.")
