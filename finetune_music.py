@@ -51,6 +51,8 @@ parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='
 parser.add_argument('input_segment_borders', action='store_true', help='Input segment borders for training')
 args = parser.parse_args()
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 def load_music_dataset(dataset_path):
     """Load music dataset"""
     logger.info(f"Loading dataset from {dataset_path}")
@@ -61,7 +63,7 @@ def load_music_dataset(dataset_path):
     else:
         dataset = load_dataset(dataset_path)
     
-    # dataset['train'] = dataset['train'].select(range(64))
+    # dataset['train'] = dataset['train'].select(range(32))
     # dataset['validation'] = dataset['validation'].select(range(1))
     # dataset['test'] = dataset['test'].select(range(1))
 
@@ -348,29 +350,36 @@ class PretrainedAudioTokenizer:
             return None
 
 def prepare_dataset_for_training(dataset, tokenizer, args):
-    """Prepare dataset for model training"""
+    """Prepare dataset for training"""
     logger.info("Preparing dataset for training...")
     
     def tokenize_function(examples):
         tokenized_inputs = []
         attention_masks = []
+        array_lens = []
+        onset_times = []
         
-        # attention_masks = torch.ones_like(codes)
-        for audio in examples["audio"]:
-            # tokens = tokenizer.tokenize_audio(audio)
-            # tokenized_inputs.append(tokens)
-            # attention_masks.append([1] * len(tokens))
+        for i, audio in enumerate(examples["audio"]):
             wav, sr = audio['array'], audio['sampling_rate']
             wav = torch.tensor(wav).unsqueeze(0).to(torch.float32)
             wav = tokenizer.convert_audio(wav, sr, 24000, 1).to(tokenizer.device)
             _, codes = tokenizer.model.encode_infer(wav, bandwidth_id=tokenizer.bandwidth_id)
             tokenized_inputs.append(codes)
             attention_masks.append([1] * len(codes))
+            array_lens.append(len(audio['array']))
+            onset_times.append(examples["label"][i]["onset_time"])
         
         # Prepare the output format for the model
         result = {
             "input_ids": tokenized_inputs,
             "attention_mask": attention_masks,
+            "label": [
+                {
+                    "onset_time": onset_times[i],
+                    "array_len": array_lens[i]
+                }
+                for i in range(len(onset_times))
+            ]
         }
         return result
     
@@ -380,22 +389,133 @@ def prepare_dataset_for_training(dataset, tokenizer, args):
         batched=True,
         batch_size=16,
     )
-    
     return tokenized_dataset
 
-def collate_fn(batch):
+def collate_fn(batch, model_name='gptneox'):
+    if model_name != 'armt':
+        # Original collate_fn for non-ARMT models
+        min_l = min([len(b['input_ids'][0][0]) for b in batch])
+        input_ids = [torch.tensor(b['input_ids'])[0, 0, :min_l] for b in batch]
+        input_ids = torch.stack(input_ids, dim=0)
+        labels = input_ids
+        return dict(
+            input_ids=input_ids,
+            labels=labels
+        )
     
+    # ARMT-specific collate_fn with segmentation
     min_l = min([len(b['input_ids'][0][0]) for b in batch])
-    logger.info(min_l)
-    assert all([torch.tensor(b['input_ids']).shape[:2] == (1, 1) for b in batch])
-    input_ids = [torch.tensor(b['input_ids'])[0, 0, :min_l] for b in batch]
-    input_ids = torch.stack(input_ids, dim=0)
-    labels = input_ids
+    
+    # Process each sample in the batch
+    all_segments = []
+    all_labels = []
+    
+    for b in batch:
+        # Get the input tokens and onset times
+        input_tokens = torch.tensor(b['input_ids'])[0, 0, :min_l]
+        onset_times = b['label']['onset_time']  # List of onset times in original audio
+        
+        # Calculate the conversion ratio based on audio array length and token sequence length
+        audio_length = b['label']['array_len']  # Length of original audio array
+        token_length = len(input_tokens)  # Length of token sequence
+        time_to_token_ratio = token_length / audio_length
+        
+        # Convert onset times to token positions
+        token_positions = [int(t * time_to_token_ratio) for t in onset_times]
+        token_positions = [p for p in token_positions if p < min_l]  # Filter out positions beyond sequence length
+        
+        # Add start and end positions
+        token_positions = [0] + token_positions + [min_l]
+        
+        # Split the sequence into segments
+        segments = []
+        label_segments = []
+        for i in range(len(token_positions) - 1):
+            start = token_positions[i]
+            end = token_positions[i + 1]
+            segment = input_tokens[start:end]
+            label_segment = input_tokens[start:end]  # Labels are the same as input tokens
+            segments.append(segment)
+            label_segments.append(label_segment)
+        
+        all_segments.append(segments)
+        all_labels.append(label_segments)
+    
+    # Find the maximum segment length for each position
+    max_segment_lengths = []
+    # First find the maximum number of segments across all samples
+    max_num_segments = max([len(segments) for segments in all_segments])
+    
+    # Then for each segment position, find the maximum length
+    for i in range(max_num_segments):
+        # Only consider samples that have this segment
+        segment_lengths = [len(sample_segments[i]) for sample_segments in all_segments if i < len(sample_segments)]
+        if segment_lengths:  # Only if we have any samples with this segment
+            max_len = max(segment_lengths)
+            max_segment_lengths.append(max_len)
+    
+    # Pad and stack segments, and create attention masks
+    padded_segments = []
+    padded_labels = []
+    attention_masks = []
+    labels_masks = []
+    for i in range(len(max_segment_lengths)):
+        # Pad and stack segments at position i with left padding
+        padded_segment = torch.stack([
+            torch.nn.functional.pad(
+                sample_segments[i],
+                (max_segment_lengths[i] - len(sample_segments[i]), 0),  # Left padding
+                mode='constant',
+                value=0  # Assuming 0 is your padding token
+            ) if i < len(sample_segments) else
+            torch.zeros(max_segment_lengths[i], dtype=torch.long)  # Create zero tensor for missing segments
+            for sample_segments in all_segments
+        ])
+        padded_segments.append(padded_segment)
+        
+        # Pad and stack label segments at position i with left padding
+        padded_label = torch.stack([
+            torch.nn.functional.pad(
+                sample_labels[i],
+                (max_segment_lengths[i] - len(sample_labels[i]), 0),  # Left padding
+                mode='constant',
+                value=0  # Assuming 0 is your padding token
+            ) if i < len(sample_labels) else
+            torch.zeros(max_segment_lengths[i], dtype=torch.long)  # Create zero tensor for missing segments
+            for sample_labels in all_labels
+        ])
+        padded_labels.append(padded_label)
+        
+        # Create attention mask for this segment position with left padding
+        attention_mask = torch.stack([
+            torch.cat([
+                torch.zeros(max_segment_lengths[i] - len(sample_segments[i])),
+                torch.ones(len(sample_segments[i]))
+            ]) if i < len(sample_segments) else
+            torch.zeros(max_segment_lengths[i])  # All zeros for missing segments
+            for sample_segments in all_segments
+        ])
+        attention_masks.append(attention_mask)
 
-    return dict(
-        input_ids=input_ids,
-        labels=labels
-    )
+        # Create labels mask for this segment position with left padding
+        labels_mask = torch.stack([
+            torch.cat([
+                torch.zeros(max_segment_lengths[i] - len(sample_labels[i]), dtype=torch.bool),
+                torch.ones(len(sample_labels[i]), dtype=torch.bool)
+            ]) if i < len(sample_labels) else
+            torch.zeros(max_segment_lengths[i], dtype=torch.bool)  # All zeros for missing segments
+            for sample_labels in all_labels
+        ])
+        labels_masks.append(labels_mask)
+    
+    return {
+        'input_ids': padded_segments,  # List of tensors, one for each segment
+        'attention_mask': attention_masks,  # List of attention masks, one for each segment
+        'labels': padded_labels,  # List of tensors, one for each segment
+        'labels_mask': labels_masks,  # List of labels masks, one for each segment
+        'input_segmented': True  # Tell the model to expect segmented input
+    }
+
 def evaluate_tokenizer_quality(dataset, tokenizer, args):
     """Evaluate the quality of tokenization by reconstruction when possible"""
     logger.info(f"Evaluating {args.tokenizer_type} tokenizer quality...")
@@ -543,13 +663,20 @@ def train_model(tokenized_dataset, tokenizer, args):
             total_samples = 0
 
             for batch in dataloader:
+                # Move tensors to device, handling both regular and segmented inputs
                 for k, v in batch.items():
-                    batch[k] = v.to(args.device)
+                    if k in ['input_ids', 'attention_mask', 'labels']:
+                        if isinstance(v, list):
+                            # For segmented inputs, move each tensor in the list
+                            batch[k] = [t.to(device) for t in v]
+                        else:
+                            # For regular inputs, move the tensor directly
+                            batch[k] = v.to(device)
 
                 with torch.no_grad():
                     outputs = model(**batch)
                 loss_tensor = outputs.get("ce_loss", outputs.loss)
-                batch_size = batch["input_ids"].size(0)
+                batch_size = batch["input_ids"][0].size(0)
                 total_loss += loss_tensor.item() * batch_size
                 total_samples += batch_size
 
@@ -562,12 +689,17 @@ def train_model(tokenized_dataset, tokenizer, args):
                 kwargs["metrics"]["eval_loss_forced"] = avg_loss
 
             return control
+
+    # Create a partial function for collate_fn with model_name
+    from functools import partial
+    collate_fn_with_model = partial(collate_fn, model_name=args.model_name)
+    
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset['train'],
         eval_dataset=tokenized_dataset['validation'],
-        data_collator=collate_fn,
+        data_collator=collate_fn_with_model,
     )
     trainer.add_callback(ForceEvalLossCallback(trainer, tokenized_dataset['validation']))
     # Train model
@@ -576,6 +708,7 @@ def train_model(tokenized_dataset, tokenizer, args):
     print(metrics)
     trainer.train()
     
+    trainer.evaluate(tokenized_dataset['test'], metric_key_prefix='test')
     # Save model
     # model.save_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
     # logger.info(f"Model saved to {args.output_dir}/{args.tokenizer_type}")
