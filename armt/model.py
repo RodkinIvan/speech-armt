@@ -684,17 +684,28 @@ class AssociativeRecurrentWrapper(torch.nn.Module):
             ):
         sliding_window = self.rmt_config['sliding_window'] if 'sliding_window' in self.rmt_config else False
         if input_segmented:
-            n_segs = input_ids.shape[1] if not (input_ids is None) else inputs_embeds.shape[1]
-            segmented = [dict(
-                input_ids=input_ids[:, i] if not (input_ids is None) else None, 
-                inputs_embeds=inputs_embeds[:, i] if not (inputs_embeds is None) else None, 
-                attention_mask=attention_mask[:, i],
-                labels=labels[:, i] if not (labels is None) else None, 
-                labels_mask=labels_mask[:, i] if not (labels_mask is None) else None, 
-            ) for i in range(n_segs)]
-            labels = torch.cat([labels[:, i] for i in range(n_segs)], dim=1)
+            # Handle pre-segmented inputs where each parameter is a list of tensors
+            n_segs = len(input_ids) if input_ids is not None else len(inputs_embeds)
+            segmented = []
+            for i in range(n_segs):
+                segment = {}
+                if input_ids is not None:
+                    segment['input_ids'] = input_ids[i]
+                if inputs_embeds is not None:
+                    segment['inputs_embeds'] = inputs_embeds[i]
+                if attention_mask is not None:
+                    segment['attention_mask'] = attention_mask[i]
+                if labels is not None:
+                    segment['labels'] = labels[i]
+                if labels_mask is not None:
+                    segment['labels_mask'] = labels_mask[i]
+                segmented.append(segment)
+            
+            # Concatenate labels and labels_mask for final loss computation
+            if labels is not None:
+                labels = torch.cat(labels, dim=1)
             if labels_mask is not None:
-                labels_mask = torch.cat([labels_mask[:, i] for i in range(n_segs)], dim=1)
+                labels_mask = torch.cat(labels_mask, dim=1)
         else:
             segmented = self.segment(input_ids=input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, labels_mask=labels_mask)
         
