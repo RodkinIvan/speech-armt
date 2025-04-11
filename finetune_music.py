@@ -639,6 +639,7 @@ def train_model(tokenized_dataset, tokenizer, args):
         lr_scheduler_type="linear",
         save_safetensors=False,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        load_best_model_at_end=True
     )
     assert len(tokenized_dataset['validation']) > 0
     # Initialize trainer
@@ -707,7 +708,6 @@ def train_model(tokenized_dataset, tokenizer, args):
     metrics = trainer.evaluate()
     print(metrics)
     trainer.train()
-    
     trainer.evaluate(tokenized_dataset['test'], metric_key_prefix='test')
     # Save model
     # model.save_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
