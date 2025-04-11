@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import json
 from transformers import AutoModelForCausalLM, AutoConfig
 from mamba_ssm import Mamba
+from transformers.integrations import WandbCallback
 
 # Load config (if needed; you could also pass config around)
 with open("./config.json", "r") as f:
@@ -76,6 +77,12 @@ class UniversalModelWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+    
+    @property
+    def device(self):
+        # Return the device of the first parameter.
+        return next(self.model.parameters()).device
+    
     def forward(self, *args, **kwargs):
         if "input_ids" in kwargs or "labels" in kwargs:
             input_ids = kwargs.pop("input_ids", None)
@@ -136,3 +143,52 @@ def initialize_model(model_name, config, block_size=2000, n_segments=2):
     else:
         raise ValueError(f"Unsupported model_name: {model_name}")
     return model.to(device)
+
+
+def get_trainer_wandb_run(trainer):
+     for callback in trainer.callback_handler.callbacks:
+         if isinstance(callback, WandbCallback):
+             return callback._wandb
+     return None
+
+from transformers import TrainerCallback
+
+class ForceEvalLossCallback(TrainerCallback):
+    def __init__(self, trainer, eval_dataset=None):
+        super().__init__()
+        
+        self.eval_dataset = eval_dataset
+        self.trainer_ref = trainer
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if self.eval_dataset is None or self.trainer_ref is None:
+            return
+
+        dataloader = self.trainer_ref.get_eval_dataloader(self.eval_dataset)
+        model = self.trainer_ref.model
+        model.eval()
+
+        total_loss = 0
+        total_samples = 0
+
+        for batch in dataloader:
+            device = self.trainer_ref.model.device
+            for k, v in batch.items():
+                batch[k] = v.to(device)
+
+            with torch.no_grad():
+                outputs = model(**batch)
+            loss_tensor = outputs.get("ce_loss", outputs.get("loss"))# for gptneox and armt outputs.loss)
+            batch_size = batch["input_ids"].size(0)
+            total_loss += loss_tensor.item() * batch_size
+            total_samples += batch_size
+
+        avg_loss = total_loss / total_samples
+        print(f"Forced eval loss: {avg_loss}")
+        get_trainer_wandb_run(self.trainer_ref).log({"eval/loss_forced": avg_loss})
+
+        # Inject it into the trainer logs so it shows up in the metrics
+        if kwargs.get("metrics") is not None:
+            kwargs["metrics"]["eval_loss_forced"] = avg_loss
+
+        return control

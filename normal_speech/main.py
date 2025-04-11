@@ -8,7 +8,7 @@ from transformers import TrainingArguments, AutoConfig
 from tqdm import tqdm
 
 from data_utils import load_speech_tokenizer, load_and_preprocess_dataset, load_sample_data, data_collator, evaluate_and_generate_audio
-from model_utils import initialize_model
+from model_utils import initialize_model, ForceEvalLossCallback
 from trainer_utils import CustomTrainer
 
 def parse_args():
@@ -55,17 +55,17 @@ def main():
     # Initialize model
     model = initialize_model(args.model_name, config)
 
-    wandb.init(project="speech_test")
+    wandb.init(project="test_2")
     training_args = TrainingArguments(
         output_dir="checkpoints",
         num_train_epochs=config['epochs'],
         per_device_train_batch_size=config.get("per_device_train_batch_size", 8),
         per_device_eval_batch_size=config.get("per_device_eval_batch_size", 8),
         evaluation_strategy="steps",
-        eval_steps=300,
+        eval_steps=200,
         logging_steps=100,
         learning_rate=config['learning_rate'],
-        max_steps=400,
+        max_steps=1000,
         save_steps=200,
         save_total_limit=5,
         report_to=["wandb"],
@@ -79,6 +79,7 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=data_collator,
     )
+    trainer.add_callback(ForceEvalLossCallback(trainer, eval_dataset))
 
     print("Starting training...")
     trainer.train()
