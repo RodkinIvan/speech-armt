@@ -16,15 +16,16 @@ BS=2
 
 MEMORY_SIZE=32
 D_MEM=64
-SEGMENT_SIZE=1024
+SEGMENT_SIZE=2800
 
-N=2
+N=12
 
 GRAD_ACC_STEPS=$((TBS/BS))
 
 MODEL_CFG=./configs/gptneox_small.json
 cd ../..
 accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_process_port $((29500+$N)) finetune_music.py \
+    --output_dir ../runs/music_model_output_armt_$N \
     --model_cfg $MODEL_CFG \
     --model_name armt \
     --tokenizer_type wavtokenizer \
@@ -37,5 +38,6 @@ accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_pr
     --num_mem_tokens $MEMORY_SIZE \
     --d_mem $D_MEM \
     --segment_size $SEGMENT_SIZE \
-    --gradient_accumulation_steps $GRAD_ACC_STEPS
+    --gradient_accumulation_steps $GRAD_ACC_STEPS \
+    --use_equal_segments
 

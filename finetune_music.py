@@ -49,8 +49,14 @@ parser.add_argument('--d_mem', type=int, default=32, help='armt parameter')
 parser.add_argument('--segment_size', type=int, default=1024, help='armt parameter')
 parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
 parser.add_argument('input_segment_borders', action='store_true', help='Input segment borders for training')
+
+parser.add_argument('--use_equal_segments', action='store_true', help='Use equal segments for training', default=False)
+parser.add_argument('--early_stopping_steps', type=int, default=None, 
+                    help='Number of validation steps to wait before early stopping')
 args = parser.parse_args()
 
+model_name = args.model_name
+segment_size = args.segment_size
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def load_music_dataset(dataset_path):
@@ -392,7 +398,7 @@ def prepare_dataset_for_training(dataset, tokenizer, args):
     return tokenized_dataset
 
 def collate_fn(batch, model_name='gptneox'):
-    if model_name != 'armt':
+    if model_name != 'armt' or args.use_equal_segments:
         # Original collate_fn for non-ARMT models
         min_l = min([len(b['input_ids'][0][0]) for b in batch])
         input_ids = [torch.tensor(b['input_ids'])[0, 0, :min_l] for b in batch]
@@ -639,7 +645,9 @@ def train_model(tokenized_dataset, tokenizer, args):
         lr_scheduler_type="linear",
         save_safetensors=False,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        load_best_model_at_end=True
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss_forced",
+        greater_is_better=False,
     )
     assert len(tokenized_dataset['validation']) > 0
     # Initialize trainer
@@ -651,10 +659,18 @@ def train_model(tokenized_dataset, tokenizer, args):
             
             self.eval_dataset = eval_dataset
             self.trainer_ref = trainer
+            self.best_loss = float('inf')
+            self.no_improvement_steps = 0
+            self.early_stopping_steps = args.early_stopping_steps
 
         def on_evaluate(self, args, state, control, **kwargs):
             if self.eval_dataset is None or self.trainer_ref is None:
                 return
+
+            # Determine if this is a test evaluation by checking for "test" in any metric key
+            metrics = kwargs.get("metrics", {})
+            is_test = any("test" in key for key in metrics.keys())
+            metric_prefix = "test" if is_test else "eval"
 
             dataloader = self.trainer_ref.get_eval_dataloader(self.eval_dataset)
             model = self.trainer_ref.model
@@ -662,16 +678,32 @@ def train_model(tokenized_dataset, tokenizer, args):
 
             total_loss = 0
             total_samples = 0
+            total_segments = 0
+            total_segment_length = 0
 
             for batch in dataloader:
-                # Move tensors to device, handling both regular and segmented inputs
+                # Move tensors to device and calculate segment lengths
+                input_ids = batch["input_ids"]
+                if isinstance(input_ids, list):
+                    # For segmented inputs, move each tensor in the list
+                    batch["input_ids"] = [t.to(device) for t in input_ids]
+                    # Calculate segment lengths
+                    for segment in input_ids:
+                        total_segments += 1
+                        total_segment_length += segment.size(-1)
+                else:
+                    # For regular inputs, move the tensor directly
+                    batch["input_ids"] = input_ids.to(device)
+                    # For non-segmented inputs, count as one segment
+                    total_segments += 1
+                    total_segment_length += segment_size if model_name == 'armt' else input_ids.size(-1)
+
+                # Move other tensors to device
                 for k, v in batch.items():
-                    if k in ['input_ids', 'attention_mask', 'labels']:
+                    if k in ['attention_mask', 'labels']:
                         if isinstance(v, list):
-                            # For segmented inputs, move each tensor in the list
                             batch[k] = [t.to(device) for t in v]
                         else:
-                            # For regular inputs, move the tensor directly
                             batch[k] = v.to(device)
 
                 with torch.no_grad():
@@ -682,12 +714,32 @@ def train_model(tokenized_dataset, tokenizer, args):
                 total_samples += batch_size
 
             avg_loss = total_loss / total_samples
-            print(f"Forced eval loss: {avg_loss}")
-            get_trainer_wandb_run(self.trainer_ref).log({"eval/loss_forced": avg_loss})
+            avg_segment_length = total_segment_length / total_segments if total_segments > 0 else 0
+            
+            print(f"Forced {metric_prefix} loss: {avg_loss}")
+            print(f"Average segment length: {avg_segment_length:.2f}")
+            
+            # Log both loss and average segment length
+            get_trainer_wandb_run(self.trainer_ref).log({
+                f"{metric_prefix}/loss_forced": avg_loss,
+                f"{metric_prefix}/avg_segment_length": avg_segment_length
+            })
 
-            # Inject it into the trainer logs so it shows up in the metrics
+            # Inject both metrics into the trainer logs
             if kwargs.get("metrics") is not None:
-                kwargs["metrics"]["eval_loss_forced"] = avg_loss
+                kwargs["metrics"][f"{metric_prefix}_loss_forced"] = avg_loss
+                kwargs["metrics"][f"{metric_prefix}_avg_segment_length"] = avg_segment_length
+
+            # Early stopping logic
+            if not is_test and self.early_stopping_steps is not None:
+                if avg_loss < self.best_loss:
+                    self.best_loss = avg_loss
+                    self.no_improvement_steps = 0
+                else:
+                    self.no_improvement_steps += 1
+                    if self.no_improvement_steps >= self.early_stopping_steps:
+                        print(f"Early stopping triggered after {self.no_improvement_steps} steps without improvement")
+                        control.should_training_stop = True
 
             return control
 
@@ -703,15 +755,23 @@ def train_model(tokenized_dataset, tokenizer, args):
         data_collator=collate_fn_with_model,
     )
     trainer.add_callback(ForceEvalLossCallback(trainer, tokenized_dataset['validation']))
+    
     # Train model
     logger.info("Starting model training...")
     metrics = trainer.evaluate()
     print(metrics)
     trainer.train()
-    trainer.evaluate(tokenized_dataset['test'], metric_key_prefix='test')
-    # Save model
-    # model.save_pretrained(f"{args.output_dir}/{args.tokenizer_type}")
-    # logger.info(f"Model saved to {args.output_dir}/{args.tokenizer_type}")
+    
+    # Final evaluation on validation set
+    logger.info("Running final evaluation on validation set...")
+    val_metrics = trainer.evaluate()
+    print("Validation metrics:", val_metrics)
+    
+    # Evaluate on test set if available
+    if 'test' in tokenized_dataset:
+        logger.info("Running evaluation on test set...")
+        test_metrics = trainer.evaluate(tokenized_dataset['test'], metric_key_prefix='test')
+        print("Test metrics:", test_metrics)
     
     # Close wandb run
     wandb.finish()

@@ -10,13 +10,15 @@ ITERS=10000
 MAX_LENGTH=8192
 LR=1e-4
 TBS=32
-BS=16
+BS=4
 
 GRAD_ACC_STEPS=$((TBS/BS))
+N=14
 
 MODEL_CFG=./configs/gptneox_small.json
 cd ../..
-accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_process_port 29501 finetune_music.py \
+accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_process_port $((29500+$N)) finetune_music.py \
+    --output_dir ../runs/music_model_output_gptneox_$N \
     --model_cfg $MODEL_CFG \
     --tokenizer_type wavtokenizer \
     --tokenizer_name $CONFIG_PATH,$MODEL_PATH \
@@ -25,4 +27,5 @@ accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_pr
     --learning_rate $LR \
     --batch_size $BS \
     --warmup_steps 100 \
-    --gradient_accumulation_steps $GRAD_ACC_STEPS
+    --gradient_accumulation_steps $GRAD_ACC_STEPS \
+    --early_stopping_steps 10
