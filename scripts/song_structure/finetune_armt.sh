@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONPATH="${PYTHONPATH}:./WavTokenizer"
 export HF_Trainer=1
 
@@ -16,9 +16,9 @@ BS=2
 
 MEMORY_SIZE=32
 D_MEM=64
-SEGMENT_SIZE=2800
+SEGMENT_SIZE=1024
 
-N=12
+N=13
 
 GRAD_ACC_STEPS=$((TBS/BS))
 
@@ -39,5 +39,5 @@ accelerate launch --num_processes $NP --config_file  ./accelerate.yaml --main_pr
     --d_mem $D_MEM \
     --segment_size $SEGMENT_SIZE \
     --gradient_accumulation_steps $GRAD_ACC_STEPS \
-    --use_equal_segments
+    --early_stopping_steps 10
 

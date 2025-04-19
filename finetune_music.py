@@ -16,6 +16,8 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from armt.model import AssociativeMemoryCell, AssociativeRecurrentWrapper
 from transformers.integrations import WandbCallback
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ args = parser.parse_args()
 
 model_name = args.model_name
 segment_size = args.segment_size
+sample_rate = args.sample_rate
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def load_music_dataset(dataset_path):
@@ -324,28 +327,59 @@ class PretrainedAudioTokenizer:
                 
         elif self.tokenizer_type == 'wavtokenizer':
             try:
-                # Reshape tokens back to the format expected by WavTokenizer
-                # This depends on the specific WavTokenizer implementation
-                # The exact reshaping will depend on how the tokens were extracted
+                # Validate tokens
+                if not isinstance(tokens, list):
+                    logger.error("Tokens must be a list")
+                    return None
+                    
+                if not tokens:
+                    logger.error("Empty token list")
+                    return None
+                    
+                # Process tokens in smaller chunks to avoid memory issues
+                chunk_size = 1024  # Adjust this based on your GPU memory
+                audio_chunks = []
                 
-                # For demonstration, assuming tokens can be reshaped into features
-                # directly. In practice, this might require additional processing.
-                tokens_tensor = torch.tensor(tokens, dtype=torch.long).to(self.device)
+                for i in range(0, len(tokens), chunk_size):
+                    chunk = tokens[i:i + chunk_size]
+                    
+                    # Validate chunk
+                    if not all(isinstance(t, (int, np.integer)) for t in chunk):
+                        logger.error("Tokens must be integers")
+                        return None
+                        
+                    # Convert to tensor and ensure proper shape
+                    tokens_tensor = torch.tensor(chunk, dtype=torch.long)
+                    tokens_tensor = tokens_tensor.unsqueeze(0)  # Add batch dimension
+                    tokens_tensor = tokens_tensor.to(self.device)
+                    
+                    # Clear GPU cache before processing each chunk
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    try:
+                        # Attempt to reconstruct features from tokens
+                        if hasattr(self.model, 'decode_from_tokens'):
+                            # If there's a direct decoding method from tokens
+                            audio_chunk = self.model.decode_from_tokens(tokens_tensor, self.bandwidth_id)
+                        else:
+                            # Otherwise try to reconstruct features first
+                            features = self.model.codes_to_features(tokens_tensor)
+                            audio_chunk = self.model.decode(features, bandwidth_id=self.bandwidth_id)
+                        
+                        # Move chunk to CPU and convert to numpy
+                        audio_chunk = audio_chunk.squeeze().cpu().numpy()
+                        audio_chunks.append(audio_chunk)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing chunk {i//chunk_size}: {str(e)}")
+                        return None
                 
-                # Attempt to reconstruct features from tokens
-                # The exact method depends on WavTokenizer implementation
-                # This is a placeholder and would need to be adapted
-                if hasattr(self.model, 'decode_from_tokens'):
-                    # If there's a direct decoding method from tokens
-                    audio_out = self.model.decode_from_tokens(tokens_tensor, self.bandwidth_id)
-                else:
-                    # Otherwise try to reconstruct features first
-                    # This is a simplification and may not work directly
-                    features = self.model.codes_to_features(tokens_tensor)
-
-                    audio_out = self.model.decode(features, bandwidth_id=self.bandwidth_id)
+                # Concatenate all chunks
+                if audio_chunks:
+                    return np.concatenate(audio_chunks)
+                return None
                 
-                return audio_out.squeeze().cpu().numpy()
             except Exception as e:
                 logger.error(f"Error in WavTokenizer decoding: {e}")
                 return None
@@ -663,6 +697,48 @@ def train_model(tokenized_dataset, tokenizer, args):
             self.no_improvement_steps = 0
             self.early_stopping_steps = args.early_stopping_steps
 
+        def compute_dtw_metrics(self, original_audio, reconstructed_audio, sample_rate):
+            """Compute DTW metrics between original and reconstructed audio"""
+            try:
+                # Make sure lengths match
+                min_len = min(len(original_audio), len(reconstructed_audio))
+                if min_len == 0:
+                    logger.warning("Empty audio sequence detected")
+                    return {'dtw_distance': float('inf'), 'normalized_dtw': float('inf')}
+                    
+                # Convert to float32 if needed
+                original_trim = original_audio[:min_len].astype(np.float32)
+                reconstructed_trim = reconstructed_audio[:min_len].astype(np.float32)
+                
+                # Normalize audio to [-1, 1] range
+                original_trim = original_trim / np.max(np.abs(original_trim))
+                reconstructed_trim = reconstructed_trim / np.max(np.abs(reconstructed_trim))
+                
+                # Extract MFCC features
+                n_mfcc = 13
+                mfcc_orig = librosa.feature.mfcc(y=original_trim, sr=sample_rate, n_mfcc=n_mfcc)
+                mfcc_recon = librosa.feature.mfcc(y=reconstructed_trim, sr=sample_rate, n_mfcc=n_mfcc)
+                
+                if mfcc_orig.size == 0 or mfcc_recon.size == 0:
+                    logger.warning("Empty MFCC features detected")
+                    return {'dtw_distance': float('inf'), 'normalized_dtw': float('inf')}
+                
+                # Transpose to time-major format
+                mfcc_orig = mfcc_orig.T
+                mfcc_recon = mfcc_recon.T
+                
+                # Calculate DTW distance
+                dtw_distance, _ = fastdtw(mfcc_orig, mfcc_recon, dist=euclidean)
+                normalized_dtw = dtw_distance / (len(mfcc_orig) + len(mfcc_recon))
+                
+                return {
+                    'dtw_distance': float(dtw_distance),
+                    'normalized_dtw': float(normalized_dtw)
+                }
+            except Exception as e:
+                logger.error(f"Error computing DTW metrics: {str(e)}")
+                return {'dtw_distance': float('inf'), 'normalized_dtw': float('inf')}
+
         def on_evaluate(self, args, state, control, **kwargs):
             if self.eval_dataset is None or self.trainer_ref is None:
                 return
@@ -680,8 +756,16 @@ def train_model(tokenized_dataset, tokenizer, args):
             total_samples = 0
             total_segments = 0
             total_segment_length = 0
+            
+            # Initialize DTW metrics
+            total_dtw_distance = 0
+            total_normalized_dtw = 0
+            dtw_samples = 0
+            dtw_failures = 0
 
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
+                logger.debug(f"Processing batch {batch_idx}")
+                
                 # Move tensors to device and calculate segment lengths
                 input_ids = batch["input_ids"]
                 if isinstance(input_ids, list):
@@ -708,6 +792,63 @@ def train_model(tokenized_dataset, tokenizer, args):
 
                 with torch.no_grad():
                     outputs = model(**batch)
+                    
+                    assert 'logits' in outputs, "Model outputs must contain logits"
+                    logger.debug(f"Logits shape: {outputs.logits.shape}")
+                    
+                    # Get the logits from the model output
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                        
+                        # Get the predicted tokens (argmax over vocabulary)
+                        predicted_tokens = torch.argmax(logits, dim=-1)
+                        logger.debug(f"Predicted tokens shape: {predicted_tokens.shape}")
+                        
+                        # Convert tokens to list and validate
+                        token_list = predicted_tokens[0].tolist()
+                        logger.debug(f"Token range: min={min(token_list)}, max={max(token_list)}")
+                        
+                        # Clear GPU cache before decoding
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        # Decode tokens back to audio
+                        reconstructed_audio = tokenizer.decode_audio(token_list)
+                        if reconstructed_audio is not None:
+                            logger.debug("Successfully decoded audio from tokens")
+                            # Get original audio from batch
+                            original_audio = batch["input_ids"][0].cpu().numpy()
+                            
+                            # Debug print shapes
+                            logger.debug(f"Original audio shape: {original_audio.shape}")
+                            logger.debug(f"Reconstructed audio shape: {reconstructed_audio.shape}")
+                            
+                            # Compute DTW metrics
+                            dtw_metrics = self.compute_dtw_metrics(
+                                original_audio,
+                                reconstructed_audio,
+                                sample_rate
+                            )
+                            
+                            if dtw_metrics['dtw_distance'] != float('inf'):
+                                total_dtw_distance += dtw_metrics['dtw_distance']
+                                total_normalized_dtw += dtw_metrics['normalized_dtw']
+                                dtw_samples += 1
+                                logger.debug(f"Successfully computed DTW metrics for sample {dtw_samples}")
+                            else:
+                                dtw_failures += 1
+                                logger.warning(f"DTW computation failed for sample {dtw_samples + dtw_failures}")
+                        else:
+                            logger.warning("Failed to decode audio from tokens")
+                            dtw_failures += 1
+                    else:
+                        logger.warning("Model outputs do not contain logits")
+                        dtw_failures += 1
+
+                # Clear GPU cache after processing batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 loss_tensor = outputs.get("ce_loss", outputs.loss)
                 batch_size = batch["input_ids"][0].size(0)
                 total_loss += loss_tensor.item() * batch_size
@@ -716,19 +857,32 @@ def train_model(tokenized_dataset, tokenizer, args):
             avg_loss = total_loss / total_samples
             avg_segment_length = total_segment_length / total_segments if total_segments > 0 else 0
             
+            # Calculate average DTW metrics
+            avg_dtw_distance = total_dtw_distance / dtw_samples if dtw_samples > 0 else float('inf')
+            avg_normalized_dtw = total_normalized_dtw / dtw_samples if dtw_samples > 0 else float('inf')
+            
             print(f"Forced {metric_prefix} loss: {avg_loss}")
             print(f"Average segment length: {avg_segment_length:.2f}")
+            print(f"Average DTW distance: {avg_dtw_distance:.4f}")
+            print(f"Average normalized DTW: {avg_normalized_dtw:.4f}")
+            print(f"DTW computation failures: {dtw_failures} out of {dtw_samples + dtw_failures} samples")
             
-            # Log both loss and average segment length
+            # Log metrics to wandb
             get_trainer_wandb_run(self.trainer_ref).log({
                 f"{metric_prefix}/loss_forced": avg_loss,
-                f"{metric_prefix}/avg_segment_length": avg_segment_length
+                f"{metric_prefix}/avg_segment_length": avg_segment_length,
+                f"{metric_prefix}/dtw_distance": avg_dtw_distance,
+                f"{metric_prefix}/normalized_dtw": avg_normalized_dtw,
+                f"{metric_prefix}/dtw_failures": dtw_failures
             })
 
-            # Inject both metrics into the trainer logs
+            # Inject metrics into the trainer logs
             if kwargs.get("metrics") is not None:
                 kwargs["metrics"][f"{metric_prefix}_loss_forced"] = avg_loss
                 kwargs["metrics"][f"{metric_prefix}_avg_segment_length"] = avg_segment_length
+                kwargs["metrics"][f"{metric_prefix}_dtw_distance"] = avg_dtw_distance
+                kwargs["metrics"][f"{metric_prefix}_normalized_dtw"] = avg_normalized_dtw
+                kwargs["metrics"][f"{metric_prefix}_dtw_failures"] = dtw_failures
 
             # Early stopping logic
             if not is_test and self.early_stopping_steps is not None:
