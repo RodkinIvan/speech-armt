@@ -1,0 +1,21 @@
+{
+    "architectures": [
+        "MambaAudioModel"
+    ],
+    "model_type": "mamba_audio",
+    "vocab_size": 2048,
+    "n_embed": 256,
+    "n_layers": 6,
+    "n_heads": 4,
+    "intermediate_size": 1024,
+    "block_size": 65536,
+    "mamba_d_state": 16,
+    "mamba_d_conv": 4,
+    "mamba_expand": 1,
+    "dropout": 0.0,
+    "initializer_range": 0.02,
+    "layer_norm_eps": 1e-05,
+    "use_cache": true,
+    "tie_word_embeddings": false,
+    "use_parallel_residual": true
+}

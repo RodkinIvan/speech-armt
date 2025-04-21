@@ -18,6 +18,9 @@ from armt.model import AssociativeMemoryCell, AssociativeRecurrentWrapper
 from transformers.integrations import WandbCallback
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
+import json
+from types import SimpleNamespace
+from mamba.model import MambaAudioModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -638,6 +641,18 @@ def load_model(model_name, tokenizer):
             memory_cell=memory_cell,
             segment_size=args.segment_size,
         )
+        return model
+    elif model_name == 'mamba':
+        # Load Mamba config from JSON file
+        with open(args.model_cfg, 'r') as f:
+            cfg_dict = json.load(f)
+        # Ensure device is set
+        cfg_dict['device'] = device
+        # Create a simple config namespace
+        config = SimpleNamespace(**cfg_dict)
+        config.vocab_size = tokenizer.vocab_size
+        # Instantiate and move model to device
+        model = MambaAudioModel(config).to(device)
         return model
     
 
