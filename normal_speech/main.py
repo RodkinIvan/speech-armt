@@ -23,10 +23,25 @@ def parse_args():
     parser.add_argument("--train_samples", type=int, default=500, help="Number of training samples to load")
     parser.add_argument("--dev_samples", type=int, default=50, help="Number of dev samples to load")
     parser.add_argument("--test_samples", type=int, default=5, help="Number of test samples to load")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed setting")
     return parser.parse_args()
 
 def main():
+    def seed_everything(seed: int):
+        import random, os
+        import numpy as np
+        import torch
+
+        random.seed(seed)
+        os.environ['PYTHONHASHSEED'] = str(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
+    
     args = parse_args()
+    seed_everything(args.random_seed)
     
     with open(args.config_path, "r") as f:
         config = json.load(f)
@@ -55,18 +70,18 @@ def main():
     # Initialize model
     model = initialize_model(args.model_name, config)
 
-    wandb.init(project="test_2")
+    wandb.init(project="test_3")
     training_args = TrainingArguments(
         output_dir="checkpoints",
         num_train_epochs=config['epochs'],
         per_device_train_batch_size=config.get("per_device_train_batch_size", 8),
         per_device_eval_batch_size=config.get("per_device_eval_batch_size", 8),
         evaluation_strategy="steps",
-        eval_steps=200,
+        eval_steps=50,
         logging_steps=100,
         learning_rate=config['learning_rate'],
         max_steps=1000,
-        save_steps=200,
+        save_steps=50,
         save_total_limit=5,
         report_to=["wandb"],
         remove_unused_columns=False
@@ -90,4 +105,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-#test case for load dataset from HF: python main.py --use_sample_data --dataset_name "parler-tts/mls_eng" --train_samples 5 --dev_samples 2 --test_samples 1
+#test case for load dataset from HF: python main.py --use_sample_data --dataset_name "parler-tts/mls_eng" --train_samples 5 --dev_samples 2 --test_samples 1 --random_seed 42
